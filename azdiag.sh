@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  azdiag.sh - Azure Update Manager diagnostics, az CLI only
+#  azdiag.sh v2 - Azure Update Manager diagnostics, az CLI only
 # -----------------------------------------------------------------------------
 #  Runs the read-only AzUpdateMgr diag script on a VM through Run Command,
-#  prints the summary, then pulls the full log (and summary JSON) back over
-#  the same Run Command channel: gzip on the VM, base64, chunked under the
-#  ~4 KB stdout cap, reassembled and verified locally.
+#  prints the summary, then pulls the full log AND summary JSON back over the
+#  same Run Command channel. Works on fully locked-down VMs (no outbound
+#  internet needed), in Cloud Shell or locally. No PowerShell required.
 #
-#  Why this way: Run Command rides the Azure host channel (WireServer), so it
-#  works on fully locked-down VMs with zero outbound internet. No storage
-#  account, no SAS tokens, no PowerShell needed on your workstation.
-#
-#  Works in Azure Cloud Shell (bash) and locally on macOS/Linux.
+#  v2 speed changes (each az Run Command call costs 1-2 min of Azure overhead,
+#  so the whole game is fewer calls):
+#    - log + summary JSON bundled into one archive on the VM (one transfer)
+#    - Windows: stdout AND stderr used as two parallel channels per call,
+#      ~7 KB of base64 per round trip instead of ~3.5 KB
+#    - transfer temp file deletes itself on the final chunk (no cleanup call)
+#    - with --full, the compress/encode prep is folded into the same call
+#      that runs the diagnostics (no separate prep call)
+#  Typical Windows full run: ~5 calls total instead of ~13.
 #
 #  Requirements:
-#    - az CLI, logged in (az login), correct subscription selected or -s flag
+#    - az CLI, logged in, correct subscription selected (or -s)
 #    - RBAC: Microsoft.Compute/virtualMachines/runCommand/action on the VM
-#      (Virtual Machine Contributor covers it)
-#    - AzUpdateMgr-Troubleshoot-Windows.ps1 / -Linux.sh in the same folder
-#      as this script (only needed when actually running diagnostics)
+#    - unzip (for Windows targets) / tar (for Linux targets) locally
+#    - AzUpdateMgr-Troubleshoot-Windows.ps1 / -Linux.sh next to this script
+#      (not needed for --fetch-only)
 #
 #  Usage:
 #    ./azdiag.sh -g <resource-group> -n <vm-name> [options]
@@ -26,22 +30,19 @@
 #  Options:
 #    -g, --resource-group   Resource group (required)
 #    -n, --name             VM name (required)
-#    -o, --os               windows | linux   (default: auto-detect from Azure)
+#    -o, --os               windows | linux   (default: auto-detect)
 #    -s, --subscription     Subscription name or id (default: current context)
 #    -d, --outdir           Where to save retrieved files (default: .)
-#        --full             Fetch the full log without prompting
-#        --no-fetch         Summary only, skip log retrieval
-#        --fetch-only       Skip diagnostics, just pull the newest existing log
+#        --full             Fetch the full log without prompting (fastest path)
+#        --no-fetch         Summary only, skip retrieval
+#        --fetch-only       Skip diagnostics, pull the newest existing log
 #        --pattern <p>      Fetch an arbitrary remote file/glob instead
-#                           (generic file grab; skips the summary JSON)
-#        --chunk <n>        base64 chars per Run Command call (default 3000)
-#        --keep-remote      Leave the temp transfer file on the VM
+#        --chunk <n>        base64 chars per channel per call (default 3600)
 #    -h, --help             Show this help
 #
 #  Examples:
-#    ./azdiag.sh -g AZ-RG-SYD-BI -n PRD-AS-IR-02
-#    ./azdiag.sh -g AZ-RG-SYD-BI -n PRD-AS-IR-02 --fetch-only --full
-#    ./azdiag.sh -g SOME-RG -n LNX-VM-01 -o linux --full
+#    ./azdiag.sh -g AZ-RG-SYD-BI -n PRD-AS-IR-02 --full
+#    ./azdiag.sh -g AZ-RG-SYD-BI -n PRD-AS-IR-02 --fetch-only
 #    ./azdiag.sh -g RG -n VM --fetch-only --pattern 'C:\Temp\somefile.txt'
 # =============================================================================
 
@@ -52,24 +53,23 @@ VM=""
 OS_TYPE=""
 SUBSCRIPTION=""
 OUTDIR="."
-CHUNK=3000
+CHUNK=3600
 DO_FULL=0
 NO_FETCH=0
 FETCH_ONLY=0
-KEEP_REMOTE=0
 CUSTOM_PATTERN=""
 CMD_ID=""
 REMOTE_RESOLVED=""
+META_LINE=""
 
 log() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 
 usage() {
-  sed -n '3,45p' "$0" | sed 's/^#  \{0,1\}//; s/^#//'
+  sed -n '3,49p' "$0" | sed 's/^#  \{0,1\}//; s/^#//'
   exit "${1:-0}"
 }
 
-# ---- arg parsing ------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
     -g|--resource-group) RG="$2"; shift 2 ;;
@@ -82,7 +82,6 @@ while [ $# -gt 0 ]; do
     --fetch-only)        FETCH_ONLY=1; shift ;;
     --pattern)           CUSTOM_PATTERN="$2"; shift 2 ;;
     --chunk)             CHUNK="$2"; shift 2 ;;
-    --keep-remote)       KEEP_REMOTE=1; shift ;;
     -h|--help)           usage 0 ;;
     *) err "Unknown option: $1"; usage 1 ;;
   esac
@@ -92,7 +91,7 @@ done
 [ -z "$VM" ] && { err "-n/--name is required"; usage 1; }
 case "$CHUNK" in ''|*[!0-9]*) err "--chunk must be a number"; exit 1 ;; esac
 if [ "$CHUNK" -gt 3800 ]; then
-  err "--chunk over 3800 risks hitting the ~4 KB stdout cap, capping at 3800"
+  err "--chunk over 3800 risks the ~4 KB stdout cap, capping at 3800"
   CHUNK=3800
 fi
 
@@ -101,7 +100,6 @@ command -v az >/dev/null 2>&1 || { err "az CLI not found. Install it or use Clou
 WORKDIR="$(mktemp -d)" || exit 1
 trap 'rm -rf "$WORKDIR"' EXIT
 
-# ---- az helpers ---------------------------------------------------------------
 azvm() {
   if [ -n "$SUBSCRIPTION" ]; then
     az "$@" --subscription "$SUBSCRIPTION"
@@ -110,70 +108,110 @@ azvm() {
   fi
 }
 
-# Run a script string (or @file) on the VM, return clean stdout.
+az_fail() {
+  err "az vm run-command invoke failed:"
+  sed 's/^/  /' "$WORKDIR/az.err" >&2
+  if grep -qi 'authorization\|AuthorizationFailed' "$WORKDIR/az.err"; then
+    err "RBAC: you need Microsoft.Compute/virtualMachines/runCommand/action on this VM (Virtual Machine Contributor covers it). If it's PIM-eligible, activate first."
+  fi
+}
+
+# Single-channel remote exec: returns clean stdout. Used for diag run and prep.
 run_remote() {
-  local raw rc
+  local raw
   raw=$(azvm vm run-command invoke -g "$RG" -n "$VM" \
           --command-id "$CMD_ID" --scripts "$1" \
-          --query 'value[0].message' -o tsv 2>"$WORKDIR/az.err")
-  rc=$?
-  if [ $rc -ne 0 ]; then
-    err "az vm run-command invoke failed:"
-    sed 's/^/  /' "$WORKDIR/az.err" >&2
-    if grep -qi 'authorization\|AuthorizationFailed' "$WORKDIR/az.err"; then
-      err "RBAC: your account needs Microsoft.Compute/virtualMachines/runCommand/action on this VM (Virtual Machine Contributor covers it). If it's PIM-eligible, activate it first."
-    fi
-    return 1
-  fi
+          --query 'value[0].message' -o tsv 2>"$WORKDIR/az.err") || { az_fail; return 1; }
   if [ "$OS_TYPE" = "linux" ]; then
     printf '%s\n' "$raw" | tr -d '\r' | sed -n '/^\[stdout\]/,/^\[stderr\]/p' | sed '1d;$d'
   else
     printf '%s\n' "$raw" | tr -d '\r'
   fi
-  return 0
+}
+
+# Dual-channel chunk fetch (Windows): reads both stdout and stderr messages,
+# extracts sentinel-wrapped base64 from each, returns them concatenated.
+run_chunk_win() {
+  local raw flat a b
+  raw=$(azvm vm run-command invoke -g "$RG" -n "$VM" \
+          --command-id "$CMD_ID" --scripts "$1" \
+          --query 'value[].message' -o tsv 2>"$WORKDIR/az.err") || { az_fail; return 1; }
+  flat=$(printf '%s' "$raw" | tr -d ' \t\r\n')
+  a=$(printf '%s' "$flat" | sed -n 's|.*A>\([A-Za-z0-9+/=]*\)<A.*|\1|p')
+  b=$(printf '%s' "$flat" | sed -n 's|.*B>\([A-Za-z0-9+/=]*\)<B.*|\1|p')
+  printf '%s%s' "$a" "$b"
+}
+
+# Single-channel chunk fetch (Linux).
+run_chunk_lin() {
+  local out
+  out=$(run_remote "$1") || return 1
+  printf '%s' "$out" | tr -cd 'A-Za-z0-9+/='
 }
 
 # ---- remote script templates --------------------------------------------------
-# __PATTERN__ / __START__ / __COUNT__ get substituted before sending.
+# Prep: resolve newest match of pattern, bundle it (plus its -summary.json if
+# one exists) into an archive, base64 it to a transfer file, emit META.
+# META|<resolved path>|<total original bytes>|<b64 length>|<file count>
 
 read -r -d '' WIN_PREP <<'EOS'
 $f = Get-ChildItem '__PATTERN__' -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $f) { Write-Output 'META-NONE' }
 else {
-  $b  = [System.IO.File]::ReadAllBytes($f.FullName)
-  $ms = New-Object System.IO.MemoryStream
-  $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
-  $gz.Write($b, 0, $b.Length)
-  $gz.Close()
-  $s = [Convert]::ToBase64String($ms.ToArray())
+  $files = @($f.FullName)
+  $j = $f.FullName -replace '\.log$', '-summary.json'
+  if (($j -ne $f.FullName) -and (Test-Path -LiteralPath $j)) { $files += $j }
+  $zip = 'C:\Windows\Temp\azdiag-transfer.zip'
+  Remove-Item $zip -Force -ErrorAction SilentlyContinue
+  Compress-Archive -LiteralPath $files -DestinationPath $zip -Force
+  $s = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($zip))
+  Remove-Item $zip -Force -ErrorAction SilentlyContinue
   [System.IO.File]::WriteAllText('C:\Windows\Temp\azdiag-transfer.b64', $s)
-  Write-Output ('META|' + $f.FullName + '|' + $b.Length + '|' + $s.Length)
+  $tot = 0
+  foreach ($x in $files) { $tot += (Get-Item -LiteralPath $x).Length }
+  Write-Output ('META|' + $f.FullName + '|' + $tot + '|' + $s.Length + '|' + $files.Count)
 }
 EOS
 
+# Dual-channel chunk with sentinels; self-deletes the transfer file once the
+# requested range reaches EOF. Sentinels (>, < are not base64 chars) keep any
+# stray stderr noise from corrupting the stream.
 read -r -d '' WIN_CHUNK <<'EOS'
-$s = [System.IO.File]::ReadAllText('C:\Windows\Temp\azdiag-transfer.b64')
-$o = __START__
-$c = __COUNT__
-if ($o -lt $s.Length) { Write-Output $s.Substring($o, [Math]::Min($c, $s.Length - $o)) }
+try {
+  $p = 'C:\Windows\Temp\azdiag-transfer.b64'
+  $s = [System.IO.File]::ReadAllText($p)
+  $o = __START__
+  $c = __COUNT__
+  if ($o -lt $s.Length) { Write-Output ('A>' + $s.Substring($o, [Math]::Min($c, $s.Length - $o)) + '<A') }
+  $o2 = $o + $c
+  if ($o2 -lt $s.Length) { [Console]::Error.Write('B>' + $s.Substring($o2, [Math]::Min($c, $s.Length - $o2)) + '<B') }
+  if (($o + $c) -ge $s.Length) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+} catch { }
 EOS
-
-WIN_CLEAN="Remove-Item 'C:\Windows\Temp\azdiag-transfer.b64' -Force -ErrorAction SilentlyContinue; Write-Output 'CLEANED'"
 
 read -r -d '' LIN_PREP <<'EOS'
 f=$(ls -t __PATTERN__ 2>/dev/null | head -n 1)
 if [ -z "$f" ]; then echo 'META-NONE'
 else
-  gzip -c "$f" | base64 -w0 > /tmp/azdiag-transfer.b64
-  o=$(wc -c < "$f" | tr -d ' ')
-  b=$(wc -c < /tmp/azdiag-transfer.b64 | tr -d ' ')
-  printf 'META|%s|%s|%s\n' "$f" "$o" "$b"
+  d=$(dirname "$f")
+  set -- "$(basename "$f")"
+  j="${f%.log}-summary.json"
+  if [ "$j" != "$f" ] && [ -f "$j" ]; then set -- "$@" "$(basename "$j")"; fi
+  tar -czf /tmp/azdiag-transfer.tgz -C "$d" "$@"
+  base64 -w0 /tmp/azdiag-transfer.tgz > /tmp/azdiag-transfer.b64
+  rm -f /tmp/azdiag-transfer.tgz
+  tot=0
+  for x in "$@"; do tot=$(( tot + $(wc -c < "$d/$x") )); done
+  printf 'META|%s|%s|%s|%s\n' "$f" "$tot" "$(wc -c < /tmp/azdiag-transfer.b64 | tr -d ' ')" "$#"
 fi
 EOS
 
-LIN_CHUNK="tail -c +__START__ /tmp/azdiag-transfer.b64 | head -c __COUNT__"
-LIN_CLEAN="rm -f /tmp/azdiag-transfer.b64; echo CLEANED"
+read -r -d '' LIN_CHUNK <<'EOS'
+tail -c +__START__ /tmp/azdiag-transfer.b64 | head -c __COUNT__
+sz=$(wc -c < /tmp/azdiag-transfer.b64 | tr -d ' ')
+if [ $(( __START__ - 1 + __COUNT__ )) -ge "$sz" ]; then rm -f /tmp/azdiag-transfer.b64; fi
+EOS
 
 # ---- base64 decode portability (GNU vs BSD/macOS) -----------------------------
 if printf 'dGVzdA==' | base64 -d >/dev/null 2>&1; then
@@ -182,62 +220,41 @@ else
   b64dec() { base64 -D; }
 fi
 
-# ---- generic file fetch over Run Command --------------------------------------
-# fetch_file <remote pattern or path> <local output path>
-# Sets REMOTE_RESOLVED to the resolved remote path on success.
-fetch_file() {
-  local pattern="$1" outfile="$2"
-  local prep chunk_tpl meta path osize b64size
-  REMOTE_RESOLVED=""
+# ---- transfer: chunk loop + decode + extract + verify --------------------------
+# Uses META_LINE (already parsed by caller into args). Extracted files land in
+# OUTDIR prefixed with the VM name.
+do_transfer() {
+  local osize="$1" b64size="$2" fcount="$3"
+  local channels=1 per_call
+  [ "$OS_TYPE" = "windows" ] && channels=2
+  per_call=$(( CHUNK * channels ))
+  local total=$(( (b64size + per_call - 1) / per_call ))
 
-  if [ "$OS_TYPE" = "windows" ]; then
-    prep="${WIN_PREP//__PATTERN__/$pattern}"
-    chunk_tpl="$WIN_CHUNK"
-  else
-    prep="${LIN_PREP//__PATTERN__/$pattern}"
-    chunk_tpl="$LIN_CHUNK"
-  fi
-
-  log "Preparing transfer on VM (gzip + base64): $pattern"
-  meta=$(run_remote "$prep") || return 1
-  meta=$(printf '%s\n' "$meta" | grep '^META' | tail -n 1)
-  if [ -z "$meta" ] || [ "$meta" = "META-NONE" ]; then
-    err "File not found on VM: $pattern"
-    return 1
-  fi
-
-  path=$(printf '%s' "$meta" | cut -d'|' -f2)
-  osize=$(printf '%s' "$meta" | cut -d'|' -f3)
-  b64size=$(printf '%s' "$meta" | cut -d'|' -f4)
-  case "$osize$b64size" in *[!0-9]*) err "Bad META from VM: $meta"; return 1 ;; esac
-
-  local total=$(( (b64size + CHUNK - 1) / CHUNK ))
-  log "Remote file : $path"
-  log "Size        : $osize bytes (${b64size} b64 chars compressed, $total chunks, ~20-40s per chunk)"
+  log "Transfer    : $osize bytes in $fcount file(s), $b64size b64 chars, $total round trips (each 1-2 min of Azure overhead)"
 
   local tmpb64="$WORKDIR/transfer.b64"
-  local tmpgz="$WORKDIR/transfer.gz"
+  local tmparc="$WORKDIR/transfer.arc"
   : > "$tmpb64"
 
   local offset=0 i=0 chunk script tries
   while [ "$offset" -lt "$b64size" ]; do
     i=$((i + 1))
     printf '\r  chunk %d/%d ' "$i" "$total"
-    # Windows Substring is 0-based, tail -c + is 1-based
     if [ "$OS_TYPE" = "windows" ]; then
-      script="${chunk_tpl//__START__/$offset}"
+      script="${WIN_CHUNK//__START__/$offset}"
     else
-      script="${chunk_tpl//__START__/$(( offset + 1 ))}"
+      script="${LIN_CHUNK//__START__/$(( offset + 1 ))}"
     fi
     script="${script//__COUNT__/$CHUNK}"
 
     tries=0
     while :; do
-      chunk=$(run_remote "$script")
-      if [ $? -eq 0 ]; then
-        chunk=$(printf '%s' "$chunk" | tr -cd 'A-Za-z0-9+/=')
-        [ -n "$chunk" ] && break
+      if [ "$OS_TYPE" = "windows" ]; then
+        chunk=$(run_chunk_win "$script")
+      else
+        chunk=$(run_chunk_lin "$script")
       fi
+      [ $? -eq 0 ] && [ -n "$chunk" ] && break
       tries=$((tries + 1))
       if [ "$tries" -ge 3 ]; then
         printf '\n'
@@ -253,33 +270,66 @@ fetch_file() {
   done
   printf '\n'
 
-  if ! b64dec < "$tmpb64" > "$tmpgz" 2>/dev/null; then
+  if ! b64dec < "$tmpb64" > "$tmparc" 2>/dev/null; then
     err "base64 decode failed, transfer corrupted. Re-run with --fetch-only."
     return 1
   fi
-  if ! gunzip -c "$tmpgz" > "$outfile" 2>/dev/null; then
-    err "gunzip failed (CRC error), transfer corrupted. Re-run with --fetch-only."
-    return 1
+
+  local exdir="$WORKDIR/extract"
+  mkdir -p "$exdir"
+  if [ "$OS_TYPE" = "windows" ]; then
+    command -v unzip >/dev/null 2>&1 || { err "unzip not found locally, needed to extract Windows archives."; return 1; }
+    unzip -o -qq "$tmparc" -d "$exdir" || { err "unzip failed (archive corrupted). Re-run with --fetch-only."; return 1; }
+  else
+    tar -xzf "$tmparc" -C "$exdir" || { err "tar extract failed (archive corrupted). Re-run with --fetch-only."; return 1; }
   fi
 
-  local got
-  got=$(wc -c < "$outfile" | tr -d ' ')
+  local got=0 fn sz saved=""
+  for fn in "$exdir"/*; do
+    [ -f "$fn" ] || continue
+    sz=$(wc -c < "$fn" | tr -d ' ')
+    got=$(( got + sz ))
+    mv "$fn" "$OUTDIR/${VM}-$(basename "$fn")"
+    saved="$saved
+  $OUTDIR/${VM}-$(basename "$fn") ($sz bytes)"
+  done
+
   if [ "$got" -ne "$osize" ]; then
-    err "Size mismatch: got $got bytes, VM reported $osize. Treat the file as suspect."
+    err "Size mismatch: extracted $got bytes, VM reported $osize. Treat files as suspect."
     return 1
   fi
-
-  log "  transfer OK ($got bytes, size verified)"
-  REMOTE_RESOLVED="$path"
+  log "Saved (size verified):$saved"
   return 0
 }
 
-cleanup_remote() {
-  [ "$KEEP_REMOTE" -eq 1 ] && { log "Leaving transfer file on VM (--keep-remote)."; return 0; }
-  local script="$LIN_CLEAN"
-  [ "$OS_TYPE" = "windows" ] && script="$WIN_CLEAN"
-  log "Cleaning up transfer file on VM..."
-  run_remote "$script" >/dev/null 2>&1
+# parse_meta <text> -> sets REMOTE_RESOLVED, M_OSIZE, M_B64, M_COUNT. rc 1 if absent.
+parse_meta() {
+  local m
+  m=$(printf '%s\n' "$1" | grep '^META' | tail -n 1)
+  [ -z "$m" ] || [ "$m" = "META-NONE" ] && return 1
+  REMOTE_RESOLVED=$(printf '%s' "$m" | cut -d'|' -f2)
+  M_OSIZE=$(printf '%s' "$m" | cut -d'|' -f3)
+  M_B64=$(printf '%s' "$m" | cut -d'|' -f4)
+  M_COUNT=$(printf '%s' "$m" | cut -d'|' -f5)
+  case "$M_OSIZE$M_B64$M_COUNT" in *[!0-9]*|'') return 1 ;; esac
+  return 0
+}
+
+fetch_via_prep() {
+  local pattern="$1" prep out
+  if [ "$OS_TYPE" = "windows" ]; then
+    prep="${WIN_PREP//__PATTERN__/$pattern}"
+  else
+    prep="${LIN_PREP//__PATTERN__/$pattern}"
+  fi
+  log "Preparing transfer on VM: $pattern"
+  out=$(run_remote "$prep") || return 1
+  if ! parse_meta "$out"; then
+    err "File not found on VM (or bad META): $pattern"
+    return 1
+  fi
+  log "Remote file : $REMOTE_RESOLVED"
+  do_transfer "$M_OSIZE" "$M_B64" "$M_COUNT"
 }
 
 # ---- main ---------------------------------------------------------------------
@@ -314,76 +364,66 @@ esac
 
 mkdir -p "$OUTDIR" || exit 1
 START_TS=$SECONDS
+PATTERN="$DEFAULT_PATTERN"
+[ -n "$CUSTOM_PATTERN" ] && PATTERN="$CUSTOM_PATTERN"
 
-# Step 1: run diagnostics (unless --fetch-only)
+HAVE_META=0
+
+# Step 1: run diagnostics (unless --fetch-only). With --full and the default
+# pattern, the prep is appended to the same call, saving a full round trip.
 if [ "$FETCH_ONLY" -eq 0 ]; then
   [ -f "$DIAG_FILE" ] || { err "Diag script not found: $DIAG_FILE (keep it next to azdiag.sh, or use --fetch-only)"; exit 1; }
+
+  FOLD_PREP=0
+  if [ "$DO_FULL" -eq 1 ] && [ -z "$CUSTOM_PATTERN" ] && [ "$NO_FETCH" -eq 0 ]; then
+    FOLD_PREP=1
+  fi
+
   log ""
-  log "=== Running diagnostics on $VM (this takes 20-60s plus Run Command overhead) ==="
-  SUMMARY=$(run_remote "@$DIAG_FILE") || exit 1
-  log ""
-  printf '%s\n' "$SUMMARY"
+  log "=== Running diagnostics on $VM ==="
+  if [ "$FOLD_PREP" -eq 1 ]; then
+    if [ "$OS_TYPE" = "windows" ]; then
+      COMBINED="$(cat "$DIAG_FILE")
+${WIN_PREP//__PATTERN__/$PATTERN}"
+    else
+      COMBINED="$(cat "$DIAG_FILE")
+${LIN_PREP//__PATTERN__/$PATTERN}"
+    fi
+    OUT=$(run_remote "$COMBINED") || exit 1
+    printf '%s\n' "$OUT" | grep -v '^META'
+    if parse_meta "$OUT"; then
+      HAVE_META=1
+      log "Remote file : $REMOTE_RESOLVED"
+    fi
+  else
+    OUT=$(run_remote "@$DIAG_FILE") || exit 1
+    printf '%s\n' "$OUT"
+  fi
   log ""
 fi
 
 # Step 2: decide whether to fetch
 if [ "$NO_FETCH" -eq 1 ]; then
-  log "Skipping log retrieval (--no-fetch)."
+  log "Skipping retrieval (--no-fetch)."
   exit 0
 fi
-if [ "$DO_FULL" -eq 0 ] && [ "$FETCH_ONLY" -eq 0 ]; then
-  if [ -t 0 ]; then
-    printf 'Fetch the full log now? [Y/n] '
-    read -r ans
-    case "$ans" in [Nn]*) log "Done. Re-run with --fetch-only later to pull the log."; exit 0 ;; esac
-  fi
+if [ "$DO_FULL" -eq 0 ] && [ "$FETCH_ONLY" -eq 0 ] && [ -t 0 ]; then
+  printf 'Fetch the full log now? [Y/n] '
+  read -r ans
+  case "$ans" in [Nn]*) log "Done. Re-run with --fetch-only later to pull the log."; exit 0 ;; esac
 fi
 
-# Step 3: fetch the log (and summary JSON when using the default pattern)
-PATTERN="$DEFAULT_PATTERN"
-FETCH_JSON=1
-if [ -n "$CUSTOM_PATTERN" ]; then
-  PATTERN="$CUSTOM_PATTERN"
-  FETCH_JSON=0
-fi
-
+# Step 3: fetch
 log ""
-log "=== Retrieving full log from $VM ==="
-TMP_OUT="$WORKDIR/fetched.bin"
-fetch_file "$PATTERN" "$TMP_OUT" || { cleanup_remote; exit 1; }
-
-# Name the local file after the VM + the remote filename
-if [ "$OS_TYPE" = "windows" ]; then
-  BASE="${REMOTE_RESOLVED##*\\}"
+log "=== Retrieving from $VM ==="
+if [ "$HAVE_META" -eq 1 ]; then
+  do_transfer "$M_OSIZE" "$M_B64" "$M_COUNT" || exit 1
 else
-  BASE="${REMOTE_RESOLVED##*/}"
+  fetch_via_prep "$PATTERN" || exit 1
 fi
-LOG_LOCAL="$OUTDIR/${VM}-${BASE}"
-mv "$TMP_OUT" "$LOG_LOCAL"
-log "Full log    : $LOG_LOCAL"
-
-# Summary JSON sits next to the log with the same stem
-if [ "$FETCH_JSON" -eq 1 ]; then
-  JSON_REMOTE="${REMOTE_RESOLVED%.log}-summary.json"
-  if [ "$OS_TYPE" = "windows" ]; then
-    JSON_BASE="${JSON_REMOTE##*\\}"
-  else
-    JSON_BASE="${JSON_REMOTE##*/}"
-  fi
-  JSON_LOCAL="$OUTDIR/${VM}-${JSON_BASE}"
-  log ""
-  log "=== Retrieving summary JSON ==="
-  if fetch_file "$JSON_REMOTE" "$JSON_LOCAL"; then
-    log "Summary JSON: $JSON_LOCAL"
-  else
-    log "Summary JSON not retrieved (log still fine)."
-  fi
-fi
-
-cleanup_remote
 
 ELAPSED=$(( SECONDS - START_TS ))
 log ""
 log "Done in ${ELAPSED}s."
-log "Read order: Summary block at the bottom of the log, then the extension"
-log ".status files, extension log tails, WU/package history, connectivity checks."
+log "Read order: Summary block at the bottom of the log, then extension .status"
+log "files, extension log tails, WU/package history, connectivity checks."
