@@ -41,8 +41,8 @@
 #    -h, --help             Show this help
 #
 #  Examples:
-#    ./azdiag.sh -g AZ-RG-SYD-BI -n PRD-AS-IR-02 --full
-#    ./azdiag.sh -g AZ-RG-SYD-BI -n PRD-AS-IR-02 --fetch-only
+#    ./azdiag.sh -g my-resource-group -n my-vm-01 --full
+#    ./azdiag.sh -g my-resource-group -n my-vm-01 --fetch-only
 #    ./azdiag.sh -g RG -n VM --fetch-only --pattern 'C:\Temp\somefile.txt'
 # =============================================================================
 
@@ -117,16 +117,35 @@ az_fail() {
 }
 
 # Single-channel remote exec: returns clean stdout. Used for diag run and prep.
+# Pulls both stdout and stderr in one call (joined with a delimiter via JMESPath)
+# so that when a remote script fails silently, the stderr is actually shown
+# instead of azdiag printing nothing.
 run_remote() {
-  local raw
+  local raw out errp
   raw=$(azvm vm run-command invoke -g "$RG" -n "$VM" \
           --command-id "$CMD_ID" --scripts "$1" \
-          --query 'value[0].message' -o tsv 2>"$WORKDIR/az.err") || { az_fail; return 1; }
+          --query "join('__AZDIAG_SPLIT__', value[].message)" -o tsv 2>"$WORKDIR/az.err") || { az_fail; return 1; }
+  raw=$(printf '%s\n' "$raw" | tr -d '\r')
+  case "$raw" in
+    *__AZDIAG_SPLIT__*)
+      out="${raw%%__AZDIAG_SPLIT__*}"
+      errp="${raw#*__AZDIAG_SPLIT__}"
+      ;;
+    *)
+      out="$raw"
+      errp=""
+      ;;
+  esac
   if [ "$OS_TYPE" = "linux" ]; then
-    printf '%s\n' "$raw" | tr -d '\r' | sed -n '/^\[stdout\]/,/^\[stderr\]/p' | sed '1d;$d'
-  else
-    printf '%s\n' "$raw" | tr -d '\r'
+    # Linux returns one message containing [stdout]/[stderr] sections
+    errp=$(printf '%s\n' "$out" | sed -n '/^\[stderr\]/,$p' | sed '1d')
+    out=$(printf '%s\n' "$out" | sed -n '/^\[stdout\]/,/^\[stderr\]/p' | sed '1d;$d')
   fi
+  if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] && [ -n "$(printf '%s' "$errp" | tr -d '[:space:]')" ]; then
+    err "Remote script produced no stdout. Remote stderr was:"
+    printf '%s\n' "$errp" | sed 's/^/  | /' >&2
+  fi
+  printf '%s\n' "$out"
 }
 
 # Dual-channel chunk fetch (Windows): reads both stdout and stderr messages,
@@ -382,18 +401,29 @@ if [ "$FETCH_ONLY" -eq 0 ]; then
   log ""
   log "=== Running diagnostics on $VM ==="
   if [ "$FOLD_PREP" -eq 1 ]; then
+    # Write the combined script to a temp file and send it via @file. Large
+    # inline script strings have been observed silently not executing through
+    # az vm run-command invoke; the @file path is the transport that is
+    # proven to work for the full-size diag script.
+    COMBINED_FILE="$WORKDIR/combined-diag"
     if [ "$OS_TYPE" = "windows" ]; then
-      COMBINED="$(cat "$DIAG_FILE")
-${WIN_PREP//__PATTERN__/$PATTERN}"
+      { cat "$DIAG_FILE"; printf '\n'; printf '%s\n' "${WIN_PREP//__PATTERN__/$PATTERN}"; } > "$COMBINED_FILE"
     else
-      COMBINED="$(cat "$DIAG_FILE")
-${LIN_PREP//__PATTERN__/$PATTERN}"
+      { cat "$DIAG_FILE"; printf '\n'; printf '%s\n' "${LIN_PREP//__PATTERN__/$PATTERN}"; } > "$COMBINED_FILE"
     fi
-    OUT=$(run_remote "$COMBINED") || exit 1
-    printf '%s\n' "$OUT" | grep -v '^META'
-    if parse_meta "$OUT"; then
-      HAVE_META=1
-      log "Remote file : $REMOTE_RESOLVED"
+    OUT=$(run_remote "@$COMBINED_FILE") || exit 1
+    if [ -z "$(printf '%s' "$OUT" | tr -d '[:space:]')" ]; then
+      # Combined call produced nothing at all: the script likely never ran.
+      # Fall back to the plain standalone diag call, then prep separately.
+      err "Combined diagnostics call returned no output. Falling back to standalone diagnostics run."
+      OUT=$(run_remote "@$DIAG_FILE") || exit 1
+      printf '%s\n' "$OUT"
+    else
+      printf '%s\n' "$OUT" | grep -v '^META'
+      if parse_meta "$OUT"; then
+        HAVE_META=1
+        log "Remote file : $REMOTE_RESOLVED"
+      fi
     fi
   else
     OUT=$(run_remote "@$DIAG_FILE") || exit 1
