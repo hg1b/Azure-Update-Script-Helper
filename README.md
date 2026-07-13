@@ -66,10 +66,10 @@ Full diagnostic plus log retrieval, no prompts:
 ./azdiag.sh -g <resource-group> -n <vm-name> --full
 ```
 
-Real example:
+Example:
 
 ```
-./azdiag.sh -g AZ-RG-SYD-BI -n PRD-AS-IR-02 --full
+./azdiag.sh -g my-resource-group -n my-vm-01 --full
 ```
 
 It auto-detects Windows vs Linux. Expect 8 to 10 minutes total. Almost all of that is Azure Run Command overhead (1 to 2 minutes per round trip), not data transfer. Progress prints as it goes.
@@ -88,7 +88,7 @@ It auto-detects Windows vs Linux. Expect 8 to 10 minutes total. Almost all of th
 ./azdiag.sh -g RG -n VM --fetch-only --pattern '/var/log/syslog'
 
 # Save retrieved files somewhere specific
-./azdiag.sh -g RG -n VM --full -d ~/Desktop/ticket-12345
+./azdiag.sh -g RG -n VM --full -d ~/Desktop/myticket
 ```
 
 All options: `./azdiag.sh -h`
@@ -99,7 +99,7 @@ First, the summary prints straight to your terminal:
 
 ```
 ==============================================================================
- Azure Update Manager diagnostics  |  PRD-AS-IR-02  (Windows)  v1.1.0
+ Azure Update Manager diagnostics  |  my-vm-01  (Windows)  v1.1.0
 ==============================================================================
  Verdict          : LOOKS HEALTHY
  OS               : Windows Server 2019 Datacenter  (build 17763.7009)
@@ -125,8 +125,8 @@ The Verdict line is the quick read. LOOKS HEALTHY means nothing actionable was f
 Then two files land in your current directory (or `-d` dir), prefixed with the VM name so nothing overwrites:
 
 ```
-PRD-AS-IR-02-AzUpdateMgr-Diag-20260712-102439Z.log            full diagnostic log
-PRD-AS-IR-02-AzUpdateMgr-Diag-20260712-102439Z-summary.json   machine-readable summary
+my-vm-01-AzUpdateMgr-Diag-20260712-102439Z.log            full diagnostic log
+my-vm-01-AzUpdateMgr-Diag-20260712-102439Z-summary.json   machine-readable summary
 ```
 
 ## Reading the full log
