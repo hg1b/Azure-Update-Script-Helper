@@ -33,7 +33,7 @@ param(
 )
 
 # --- Bootstrap ---------------------------------------------------------------
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 $ErrorActionPreference = 'Continue'    # never let one failure kill the script
 $ProgressPreference    = 'SilentlyContinue'
 $startedUtc            = (Get-Date).ToUniversalTime()
@@ -212,6 +212,36 @@ Invoke-Safe 'Update Manager extensions on disk' {
             }
         }
     }
+
+    # Surface the newest patch-extension status into the summary. This .status
+    # record is exactly what Azure Update Manager reads, so it is the single
+    # fastest signal when an assessment or install "fails" in the portal.
+    try {
+        $statusFile = Get-ChildItem $pluginRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'Microsoft.CPlat.Core.WindowsPatchExtension*' -or
+                           $_.Name -like 'Microsoft.SoftwareUpdateManagement.WindowsOsUpdateExtension*' } |
+            ForEach-Object { Get-ChildItem (Join-Path $_.FullName 'Status') -Filter *.status -ErrorAction SilentlyContinue } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($statusFile) {
+            $st = Get-Content -LiteralPath $statusFile.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($st -is [array]) { $st = $st[0] }
+            $extMsg = $null
+            if ($st.status.formattedMessage.message) {
+                $extMsg = ($st.status.formattedMessage.message -replace '\s+', ' ').Trim()
+                if ($extMsg.Length -gt 300) { $extMsg = $extMsg.Substring(0, 300) + '...' }
+            }
+            $summary.PatchExtensionStatus = [pscustomobject]@{
+                Status    = "$($st.status.status)"
+                Operation = "$($st.status.operation)"
+                Code      = $st.status.code
+                Message   = $extMsg
+                TimeUtc   = $statusFile.LastWriteTime.ToUniversalTime().ToString('s') + 'Z'
+            }
+            if ($st.status.status -and "$($st.status.status)" -notmatch '^(?i)(success|transitioning)') {
+                $summary.Warnings.Add("Patch extension latest status is '$($st.status.status)' ($($statusFile.LastWriteTime)): $extMsg") | Out-Null
+            }
+        }
+    } catch { }
 }
 
 Invoke-Safe 'Update extension logs (tails)' {
@@ -406,6 +436,20 @@ Invoke-Safe 'Windows Update client (recent history via COM, read-only)' {
             }
             $failed = $rows | Where-Object { $_.ResultCode -in 'Failed','SucceededWithErrors','Aborted' }
             $summary.RecentUpdateFailures = @($failed | Select-Object -First 10)
+            $summary.RecentFailureCount   = @($failed).Count
+            $lastOk = $rows | Where-Object { $_.Operation -eq 'Install' -and $_.ResultCode -eq 'Succeeded' } |
+                      Sort-Object Date -Descending | Select-Object -First 1
+            if ($lastOk) {
+                $summary.LastInstallSuccessTime  = $lastOk.Date.ToUniversalTime().ToString('s') + 'Z'
+                $summary.LastInstallSuccessTitle = $lastOk.Title
+                # A recent successful install proves detection works even when
+                # the legacy Results\Detect registry key is empty (normal on
+                # USO-driven Server 2016+). Drop that warning as a false positive.
+                if (((Get-Date) - $lastOk.Date).TotalDays -lt 35) {
+                    $stale = @($summary.Warnings | Where-Object { $_ -like 'No Windows Update detection LastSuccessTime*' })
+                    foreach ($w in $stale) { [void]$summary.Warnings.Remove($w) }
+                }
+            }
             $rows | Format-Table -AutoSize -Wrap
         }
     } catch {
@@ -599,15 +643,21 @@ Invoke-Safe 'Connectivity to update endpoints (TCP 443, DNS only)' {
     }
 
     $timeoutMs = $PerCommandTimeoutSec * 1000
-    $endpoints | ForEach-Object {
-        $e = $_
+    $connResults = foreach ($e in $endpoints) {
         try {
             $t = Test-TcpPort -ComputerName $e -Port 443 -TimeoutMs $timeoutMs
             [pscustomobject]@{ Endpoint = $e; TCP443 = $t }
         } catch {
-            [pscustomobject]@{ Endpoint = $e; TCP443 = "err: $($_.Exception.Message)" }
+            [pscustomobject]@{ Endpoint = $e; TCP443 = $false }
         }
-    } | Format-Table -AutoSize
+    }
+    $connResults | Format-Table -AutoSize
+    $badEndpoints = @($connResults | Where-Object { $_.TCP443 -ne $true } | ForEach-Object { $_.Endpoint })
+    $summary.EndpointsChecked     = $endpoints.Count
+    $summary.EndpointsUnreachable = $badEndpoints
+    if ($badEndpoints.Count -gt 0) {
+        $summary.Warnings.Add('Unreachable update endpoints on TCP 443: ' + ($badEndpoints -join ', ')) | Out-Null
+    }
 
     "---- Proxy config (WinHTTP) ----"
     try { netsh winhttp show proxy 2>&1 } catch { $_.Exception.Message }
@@ -680,6 +730,30 @@ Invoke-Safe 'Guest patch settings (from IMDS)' {
     }
 }
 
+# --- Summary enrichment (cheap, independent, best-effort) ---------------------
+try {
+    $cv  = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+    $ubr = if ($null -ne $cv.UBR) { ".$($cv.UBR)" } else { '' }
+    $summary.OsName  = $cv.ProductName
+    $summary.OsBuild = "$($cv.CurrentBuildNumber)$ubr"
+} catch { }
+try {
+    $osci = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $summary.LastBootUtc = $osci.LastBootUpTime.ToUniversalTime().ToString('s') + 'Z'
+    $summary.UptimeDays  = [math]::Round(((Get-Date) - $osci.LastBootUpTime).TotalDays, 1)
+    if ($summary.UptimeDays -gt 60) {
+        $summary.Warnings.Add("Uptime is $($summary.UptimeDays) days - long-running servicing stacks are a common source of install failures. Consider a reboot window.") | Out-Null
+    }
+} catch { }
+try {
+    $wu = Get-Service wuauserv -ErrorAction Stop
+    $summary.WuauservStatus    = "$($wu.Status)"
+    $summary.WuauservStartType = "$($wu.StartType)"
+    if ("$($wu.StartType)" -eq 'Disabled') {
+        $summary.Warnings.Add('wuauserv (Windows Update service) start type is DISABLED - scans and installs cannot run. Common root cause.') | Out-Null
+    }
+} catch { }
+
 # --- Summary block -----------------------------------------------------------
 Write-Section 'Summary'
 $summary.FinishedUtc = (Get-Date).ToUniversalTime().ToString('o')
@@ -692,56 +766,65 @@ Add-Content -LiteralPath $logPath -Value $summaryJsonText -Encoding UTF8
 
 $logSize = (Get-Item $logPath).Length
 
-# Build a ready-to-paste Az PowerShell one-liner. IMDS provides VM name + RG;
-# fall back to placeholders if IMDS was unreachable (Arc / offline machines).
-$vmNameForCmd = if ($summary.VmName)        { $summary.VmName }        else { '<vm-name>' }
-$rgForCmd     = if ($summary.ResourceGroup) { $summary.ResourceGroup } else { '<resource-group>' }
-$logLeaf      = Split-Path $logPath  -Leaf
-$jsonLeaf     = Split-Path $jsonPath -Leaf
-$localLog     = "C:\Temp\$logLeaf"
-$localJson    = "C:\Temp\$jsonLeaf"
+# --- Compact stdout summary ----------------------------------------------------
+# This is the only stdout the script produces (Run Command caps stdout at
+# ~4 KB). Retrieval of the full log is handled by azdiag.sh.
 
-# Assemble the two commands as plain strings. Single-quoted segments are
-# concatenated so nothing interpolates unexpectedly and there are no nested
-# double quotes to escape. Inner script (run on the VM) uses single quotes
-# around the path so the outer double-quoted -ScriptString works cleanly.
-$q = [char]34   # literal double-quote, keeps this line free of escaping headaches
-# The one-liners create C:\Temp on the LOCAL PC first (Set-Content does not
-# auto-create parent directories), then invoke Run Command and save the output.
-$fetchLog  = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -VMName '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$logPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localLog' -Encoding UTF8"
-$fetchJson = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -VMName '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$jsonPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localJson' -Encoding UTF8"
+$verdict = 'LOOKS HEALTHY'
+if ($summary.Warnings.Count -gt 0) { $verdict = "REVIEW WARNINGS ($($summary.Warnings.Count))" }
+$needsAttention = $false
+if ($summary.Errors.Count -gt 0)                                                          { $needsAttention = $true }
+if ($summary.Contains('RecentFailureCount') -and $summary.RecentFailureCount -gt 0)       { $needsAttention = $true }
+if ($summary.Contains('EndpointsUnreachable') -and @($summary.EndpointsUnreachable).Count -gt 0) { $needsAttention = $true }
+if ($summary.Contains('WuauservStartType') -and $summary.WuauservStartType -eq 'Disabled') { $needsAttention = $true }
+if ($summary.Contains('PatchExtensionStatus') -and "$($summary.PatchExtensionStatus.Status)" -match '^(?i)error|fail') { $needsAttention = $true }
+if ($needsAttention) { $verdict = 'NEEDS ATTENTION' }
 
-$compact = @"
-=== Azure Update Manager diag (Windows) ===
-Version          : $ScriptVersion
-Host             : $env:COMPUTERNAME
-Started (UTC)    : $($startedUtc.ToString('s'))Z
-Finished (UTC)   : $($summary.FinishedUtc)
-Log file         : $logPath  ($([math]::Round($logSize/1KB,1)) KB)
-Summary JSON     : $jsonPath
-Reboot pending?  : $($summary.RebootPending)$(if ($summary.RebootPending -and $summary.RebootPendingReasons) {
-    "`r`n  Reasons        :`r`n" + (($summary.RebootPendingReasons | ForEach-Object { "    - $($_.Signal): $($_.Evidence)" }) -join "`r`n")
-})
-Free on C:       : $($summary.SystemDriveFreeGB) GB
-VM Resource ID   : $($summary.ResourceId)
-Detected VM/RG   : $vmNameForCmd  /  $rgForCmd
-Warnings         : $($summary.Warnings.Count)$(if ($summary.Warnings.Count -gt 0) {
-    "`r`n" + (($summary.Warnings | ForEach-Object { "    - $_" }) -join "`r`n")
-})
-Errors captured  : $($summary.Errors.Count)
-
---- Retrieve from your local PowerShell (Az module) ---
-Prereq (once per session):  Connect-AzAccount
-(C:\Temp is created automatically by the one-liners below.)
-
-# Full log:
-$fetchLog
-
-# Summary JSON:
-$fetchJson
-
-Note: Run Command truncates stdout to ~4 KB per invocation. For logs
-larger than ~4 KB (virtually all real logs), see the "Retrieving large
-logs" section in the README for a working chunked-base64 download pattern.
-"@
-Write-Output $compact
+$sep  = '=' * 78
+$thin = '-' * 78
+$L = New-Object System.Collections.Generic.List[string]
+$L.Add($sep)
+$L.Add(" Azure Update Manager diagnostics  |  $env:COMPUTERNAME  (Windows)  v$ScriptVersion")
+$L.Add($sep)
+$L.Add(" Verdict          : $verdict")
+if ($summary.Contains('OsName')) {
+    $L.Add(" OS               : $($summary.OsName)  (build $($summary.OsBuild))")
+}
+if ($summary.Contains('UptimeDays')) {
+    $L.Add(" Uptime           : $($summary.UptimeDays) days  (booted $($summary.LastBootUtc))")
+}
+$L.Add(" Reboot pending   : $(if ($summary.RebootPending) { 'YES' } else { 'No' })")
+if ($summary.RebootPending -and $summary.RebootPendingReasons) {
+    $summary.RebootPendingReasons | ForEach-Object { $L.Add("                      - $($_.Signal): $($_.Evidence)") }
+}
+$L.Add(" Disk free (C:)   : $($summary.SystemDriveFreeGB) GB")
+$L.Add(" WSUS             : $(if ($summary.WsusConfigured) { $summary.WsusServer } else { 'Not configured (Microsoft Update direct)' })")
+if ($summary.Contains('WuauservStatus')) {
+    $L.Add(" wuauserv         : $($summary.WuauservStatus) / $($summary.WuauservStartType)")
+}
+if ($summary.Contains('PatchExtensionStatus')) {
+    $L.Add(" Patch extension  : $($summary.PatchExtensionStatus.Status)  (as of $($summary.PatchExtensionStatus.TimeUtc))")
+} else {
+    $L.Add(" Patch extension  : <no .status file found>")
+}
+if ($summary.Contains('LastInstallSuccessTime')) {
+    $kb = ''
+    if ($summary.LastInstallSuccessTitle -match 'KB\d+') { $kb = "  ($($Matches[0]))" }
+    $L.Add(" Last install OK  : $($summary.LastInstallSuccessTime)$kb")
+}
+if ($summary.Contains('RecentFailureCount')) {
+    $L.Add(" Recent failures  : $($summary.RecentFailureCount) in last $RecentUpdateCount history entries")
+}
+if ($summary.Contains('EndpointsChecked')) {
+    $bad = @($summary.EndpointsUnreachable)
+    $L.Add(" Endpoints        : $($summary.EndpointsChecked - $bad.Count)/$($summary.EndpointsChecked) reachable$(if ($bad.Count) { '  (FAIL: ' + ($bad -join ', ') + ')' })")
+}
+$L.Add(" Warnings         : $($summary.Warnings.Count)")
+$summary.Warnings | ForEach-Object { $L.Add("   - $_") }
+$L.Add(" Errors           : $($summary.Errors.Count)")
+$summary.Errors | ForEach-Object { $L.Add("   - $_") }
+$L.Add($thin)
+$L.Add(" Log file     : $logPath  ($([math]::Round($logSize/1KB,1)) KB)")
+$L.Add(" Summary JSON : $jsonPath")
+$L.Add($sep)
+Write-Output ($L -join "`r`n")

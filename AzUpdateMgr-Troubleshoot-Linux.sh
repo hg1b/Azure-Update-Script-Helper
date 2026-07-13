@@ -26,7 +26,7 @@
 # =============================================================================
 
 # ---- config -----------------------------------------------------------------
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 TAIL_LINES="${TAIL_LINES:-200}"
 CMD_TIMEOUT="${CMD_TIMEOUT:-45}"          # per external command (seconds)
 RECENT_COUNT="${RECENT_COUNT:-25}"        # recent updates / history entries
@@ -599,26 +599,35 @@ cat > "$JSON" <<JSON
 JSON
 chmod 600 "$JSON" 2>/dev/null || true
 
+VERDICT="LOOKS HEALTHY"
+[ "$WARN_COUNT" -gt 0 ] && VERDICT="REVIEW WARNINGS ($WARN_COUNT)"
+[ "$ERR_COUNT" -gt 0 ] && VERDICT="NEEDS ATTENTION"
+[ "$REBOOT_REQUIRED" = "yes" ] && VERDICT="NEEDS ATTENTION"
+
+# Pull the actual warning/error messages back out of the log for the summary
+# (they are tagged [WARN]/[ERROR] by log()). Deduped, capped at 10 each.
+WARN_LINES=$(grep ' \[WARN\] '  "$LOG" 2>/dev/null | sed 's/^\[[^]]*\] \[WARN\] /   - /'  | sort -u | head -10)
+ERR_LINES=$(grep ' \[ERROR\] ' "$LOG" 2>/dev/null | sed 's/^\[[^]]*\] \[ERROR\] /   - /' | sort -u | head -10)
+WARN_BLOCK=" Warnings         : $WARN_COUNT"
+[ -n "$WARN_LINES" ] && WARN_BLOCK="$WARN_BLOCK
+$WARN_LINES"
+ERR_BLOCK=" Errors           : $ERR_COUNT"
+[ -n "$ERR_LINES" ] && ERR_BLOCK="$ERR_BLOCK
+$ERR_LINES"
+
 cat <<EOF
-=== Azure Update Manager diag (Linux) ===
-Version          : $SCRIPT_VERSION
-Host             : $(hostname)
-Distro / pkg mgr : $DISTRO / $PKG_MGR
-Started (UTC)    : $START_ISO
-Finished (UTC)   : $(date -u +%Y-%m-%dT%H:%M:%SZ)
-Log file         : $LOG  (${LOG_KB} KB)
-Summary JSON     : $JSON
-Reboot required  : $REBOOT_REQUIRED
-Free MB /,/var,/boot : ${FREE_MB_ROOT:-?}, ${FREE_MB_VAR:-?}, ${FREE_MB_BOOT:-?}
-VM Resource ID   : ${VM_RESOURCE_ID:-<IMDS unreachable>}
-Warnings raised  : $WARN_COUNT
-Errors           : $ERR_COUNT
-
-Retrieve the full log from your local PowerShell (Az module):
-  Invoke-AzVMRunCommand -ResourceGroupName <rg> -VMName <vm> `
-    -CommandId RunShellScript -ScriptString "cat $LOG"
-
-Note: Run Command truncates stdout to ~4 KB. For logs larger than ~4 KB
-(virtually all real logs), see the "Retrieving large logs" section in the
-README for a working chunked-base64 download pattern.
+==============================================================================
+ Azure Update Manager diagnostics  |  $(hostname)  (Linux)  v$SCRIPT_VERSION
+==============================================================================
+ Verdict          : $VERDICT
+ Distro / pkg mgr : $DISTRO / $PKG_MGR
+ Reboot required  : $REBOOT_REQUIRED
+ Free MB          : / ${FREE_MB_ROOT:-?}   /var ${FREE_MB_VAR:-?}   /boot ${FREE_MB_BOOT:-?}
+ VM resource ID   : ${VM_RESOURCE_ID:-<IMDS unreachable>}
+${WARN_BLOCK}
+${ERR_BLOCK}
+------------------------------------------------------------------------------
+ Log file     : $LOG  (${LOG_KB} KB)
+ Summary JSON : $JSON
+==============================================================================
 EOF
