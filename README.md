@@ -20,8 +20,8 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
 2. Pick Bash if asked
 3. Upload the three files: Manage files > Upload, or clone the repo:
    ```
-   git clone <repo-url>
-   cd <repo-folder>
+   git clone https://github.com/hg1b/Azure-Update-Script-Helper
+   cd Azure-Update-Script-Helper
    chmod +x azdiag.sh
    ```
 4. Cloud Shell is already logged in as you. Skip to "Pick your subscription".
@@ -55,6 +55,24 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
    ```
    chmod +x azdiag.sh
    ```
+
+### Option C: Windows (WSL or Git Bash)
+ 
+1. You need a bash environment: WSL (Ubuntu) or Git Bash. PowerShell alone can't run this script.
+2. In WSL, install unzip once (needed to extract Windows VM archives):
+```
+   sudo apt install unzip
+```
+3. Run with `bash` in front instead of `./`:
+```
+   bash azdiag.sh -g my-resource-group -n my-vm-01 --full
+```
+4. If you see errors like `$'\r': command not found`, the file picked up Windows line endings. Fix once:
+```
+   sed -i 's/\r//' azdiag.sh
+```
+5. Both az CLI flavors work: the Windows az CLI called from WSL/Git Bash, or the Linux az CLI installed inside WSL. Path translation is handled automatically.
+
 
 ### Pick your subscription
 

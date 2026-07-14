@@ -108,6 +108,24 @@ azvm() {
   fi
 }
 
+# When bash runs on Windows (WSL or Git Bash) but az is the WINDOWS CLI, @file
+# paths must be Windows-visible or az silently passes the literal '@...' text
+# through as the script. Detect the combo and translate paths.
+AZ_PATH_MODE=none
+if command -v cygpath >/dev/null 2>&1; then
+  AZ_PATH_MODE=cygpath   # Git Bash / MSYS: az there is always the Windows CLI
+elif command -v wslpath >/dev/null 2>&1; then
+  case "$(command -v az 2>/dev/null)" in /mnt/*) AZ_PATH_MODE=wslpath ;; esac
+fi
+
+native_path() {
+  case "$AZ_PATH_MODE" in
+    wslpath) wslpath -w "$1" ;;
+    cygpath) cygpath -w "$1" ;;
+    *)       printf '%s' "$1" ;;
+  esac
+}
+
 az_fail() {
   err "az vm run-command invoke failed:"
   sed 's/^/  /' "$WORKDIR/az.err" >&2
@@ -144,6 +162,9 @@ run_remote() {
   if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] && [ -n "$(printf '%s' "$errp" | tr -d '[:space:]')" ]; then
     err "Remote script produced no stdout. Remote stderr was:"
     printf '%s\n' "$errp" | sed 's/^/  | /' >&2
+    if printf '%s' "$errp" | grep -qi 'RunCommand.*denied\|Access to the path.*script[0-9]*\.ps1'; then
+      err "Hint: access denied on the Run Command extension's own script path usually means antivirus/ASR is blocking the script (large scripts with base64 can trip 'obfuscated script' rules), or the extension is wedged. Try a trivial script first (--scripts \"whoami\"), and if that also fails, reset the extension: az vm run-command invoke --command-id RemoveRunCommandWindowsExtension -g <rg> -n <vm>"
+    fi
   fi
   printf '%s\n' "$out"
 }
@@ -240,6 +261,20 @@ else
 fi
 
 # ---- transfer: chunk loop + decode + extract + verify --------------------------
+have_zip_extractor() {
+  command -v unzip   >/dev/null 2>&1 && return 0
+  command -v python3 >/dev/null 2>&1 && return 0
+  return 1
+}
+
+extract_zip() {  # $1 = zip file, $2 = dest dir
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -o -qq "$1" -d "$2"
+  else
+    python3 -c 'import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$1" "$2"
+  fi
+}
+
 # Uses META_LINE (already parsed by caller into args). Extracted files land in
 # OUTDIR prefixed with the VM name.
 do_transfer() {
@@ -248,6 +283,13 @@ do_transfer() {
   [ "$OS_TYPE" = "windows" ] && channels=2
   per_call=$(( CHUNK * channels ))
   local total=$(( (b64size + per_call - 1) / per_call ))
+
+  # Fail fast BEFORE spending round trips if we can't extract at the end
+  if [ "$OS_TYPE" = "windows" ] && ! have_zip_extractor; then
+    err "No zip extractor found locally (need unzip or python3)."
+    err "Install one first, e.g.: sudo apt install unzip"
+    return 1
+  fi
 
   log "Transfer    : $osize bytes in $fcount file(s), $b64size b64 chars, $total round trips (each 1-2 min of Azure overhead)"
 
@@ -297,10 +339,19 @@ do_transfer() {
   local exdir="$WORKDIR/extract"
   mkdir -p "$exdir"
   if [ "$OS_TYPE" = "windows" ]; then
-    command -v unzip >/dev/null 2>&1 || { err "unzip not found locally, needed to extract Windows archives."; return 1; }
-    unzip -o -qq "$tmparc" -d "$exdir" || { err "unzip failed (archive corrupted). Re-run with --fetch-only."; return 1; }
+    if ! extract_zip "$tmparc" "$exdir"; then
+      cp "$tmparc" "$OUTDIR/${VM}-diag-transfer.zip"
+      err "Extraction failed, but the transfer is saved: $OUTDIR/${VM}-diag-transfer.zip"
+      err "Extract it manually (unzip / Expand-Archive) - no need to re-transfer."
+      return 1
+    fi
   else
-    tar -xzf "$tmparc" -C "$exdir" || { err "tar extract failed (archive corrupted). Re-run with --fetch-only."; return 1; }
+    if ! tar -xzf "$tmparc" -C "$exdir"; then
+      cp "$tmparc" "$OUTDIR/${VM}-diag-transfer.tgz"
+      err "Extraction failed, but the transfer is saved: $OUTDIR/${VM}-diag-transfer.tgz"
+      err "Extract it manually (tar -xzf) - no need to re-transfer."
+      return 1
+    fi
   fi
 
   local got=0 fn sz saved=""
@@ -411,12 +462,12 @@ if [ "$FETCH_ONLY" -eq 0 ]; then
     else
       { cat "$DIAG_FILE"; printf '\n'; printf '%s\n' "${LIN_PREP//__PATTERN__/$PATTERN}"; } > "$COMBINED_FILE"
     fi
-    OUT=$(run_remote "@$COMBINED_FILE") || exit 1
+    OUT=$(run_remote "@$(native_path "$COMBINED_FILE")") || exit 1
     if [ -z "$(printf '%s' "$OUT" | tr -d '[:space:]')" ]; then
       # Combined call produced nothing at all: the script likely never ran.
       # Fall back to the plain standalone diag call, then prep separately.
       err "Combined diagnostics call returned no output. Falling back to standalone diagnostics run."
-      OUT=$(run_remote "@$DIAG_FILE") || exit 1
+      OUT=$(run_remote "@$(native_path "$DIAG_FILE")") || exit 1
       printf '%s\n' "$OUT"
     else
       printf '%s\n' "$OUT" | grep -v '^META'
@@ -426,7 +477,7 @@ if [ "$FETCH_ONLY" -eq 0 ]; then
       fi
     fi
   else
-    OUT=$(run_remote "@$DIAG_FILE") || exit 1
+    OUT=$(run_remote "@$(native_path "$DIAG_FILE")") || exit 1
     printf '%s\n' "$OUT"
   fi
   log ""
