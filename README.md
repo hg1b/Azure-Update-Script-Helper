@@ -26,7 +26,7 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
    ```
 4. Cloud Shell is already logged in as you. Skip to "Pick your subscription".
 
-### Option B: Local terminal (Mac or Linux)
+### Option B: Local terminal (Mac, Linux, Windows)
 
 1. Install the Azure CLI:
    ```
@@ -35,6 +35,10 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
 
    # Ubuntu/Debian
    curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+   # Windows
+    winget install --id Microsoft.AzureCLI
+
    ```
 2. Log in:
    ```
