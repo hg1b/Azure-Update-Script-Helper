@@ -51,7 +51,7 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
    az account set --subscription "subscription123"
    ```
 
-4. Make the script executable (first time only):
+4. Make the script executable (Mac Only!) (first time only):
    ```
    chmod +x azdiag.sh
    ```
@@ -70,7 +70,12 @@ Or skip this and pass `-s "SUB-NAME-OR-ID"` on every azdiag run.
 
 ## Run it
 
-Full diagnostic plus log retrieval, no prompts:
+Full diagnostic plus log retrieval, no prompts (Windows)
+```
+bash azdiag.sh -g <resource-group> -n <vm-name> --full
+```
+
+Full diagnostic plus log retrieval, no prompts (Mac)
 
 ```
 ./azdiag.sh -g <resource-group> -n <vm-name> --full
