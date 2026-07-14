@@ -45,7 +45,13 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
    az login
    ```
    A browser window opens. If it doesn't, use `az login --use-device-code` and follow the prompt.
-3. Make the script executable (first time only):
+
+3. Set Tenant Subscription
+   ```
+   az account set --subscription "subscription123"
+   ```
+
+4. Make the script executable (first time only):
    ```
    chmod +x azdiag.sh
    ```
