@@ -38,6 +38,12 @@
 #        --fetch-only       Skip diagnostics, pull the newest existing log
 #        --pattern <p>      Fetch an arbitrary remote file/glob instead
 #        --chunk <n>        base64 chars per channel per call (default 3600)
+#        --wu-log           Windows only: also convert the WU ETW trace on the
+#                           VM (Get-WindowsUpdateLog, adds ~10-30s) and query
+#                           DeliveryOptimization error events. The only source
+#                           for WinHTTP-layer failures like 0x80072EFD that
+#                           never reach WU history or the extension log. Run
+#                           close to the failure window - ETW buffers rotate.
 #    -h, --help             Show this help
 #
 #  Examples:
@@ -59,6 +65,8 @@ NO_FETCH=0
 FETCH_ONLY=0
 CUSTOM_PATTERN=""
 CMD_ID=""
+WU_LOG=0
+DIAG_PARAMS=""
 REMOTE_RESOLVED=""
 META_LINE=""
 
@@ -66,7 +74,7 @@ log() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 
 usage() {
-  sed -n '3,49p' "$0" | sed 's/^#  \{0,1\}//; s/^#//'
+  sed -n '3,52p' "$0" | sed 's/^#  \{0,1\}//; s/^#//'
   exit "${1:-0}"
 }
 
@@ -82,7 +90,8 @@ while [ $# -gt 0 ]; do
     --fetch-only)        FETCH_ONLY=1; shift ;;
     --pattern)           CUSTOM_PATTERN="$2"; shift 2 ;;
     --chunk)             CHUNK="$2"; shift 2 ;;
-    -h|--help)           usage 0 ;;
+    --wu-log)            WU_LOG=1; shift ;;
+    -h|--help)           usage 0 ;; 
     *) err "Unknown option: $1"; usage 1 ;;
   esac
 done
@@ -140,9 +149,15 @@ az_fail() {
 # instead of azdiag printing nothing.
 run_remote() {
   local raw out errp
-  raw=$(azvm vm run-command invoke -g "$RG" -n "$VM" \
-          --command-id "$CMD_ID" --scripts "$1" \
-          --query "join('__AZDIAG_SPLIT__', value[].message)" -o tsv 2>"$WORKDIR/az.err") || { az_fail; return 1; }
+  if [ -n "$2" ]; then
+    raw=$(azvm vm run-command invoke -g "$RG" -n "$VM" \
+            --command-id "$CMD_ID" --scripts "$1" --parameters "$2" \
+            --query "join('__AZDIAG_SPLIT__', value[].message)" -o tsv 2>"$WORKDIR/az.err") || { az_fail; return 1; }
+  else
+    raw=$(azvm vm run-command invoke -g "$RG" -n "$VM" \
+            --command-id "$CMD_ID" --scripts "$1" \
+            --query "join('__AZDIAG_SPLIT__', value[].message)" -o tsv 2>"$WORKDIR/az.err") || { az_fail; return 1; }
+  fi
   raw=$(printf '%s\n' "$raw" | tr -d '\r')
   case "$raw" in
     *__AZDIAG_SPLIT__*)
@@ -432,6 +447,14 @@ case "$OS_TYPE" in
   *) err "OS must be windows or linux, got: $OS_TYPE"; exit 1 ;;
 esac
 
+if [ "$WU_LOG" -eq 1 ]; then
+  if [ "$OS_TYPE" = "windows" ]; then
+    DIAG_PARAMS="IncludeWuLog=true"
+  else
+    err "--wu-log is Windows only, ignoring for this Linux target."
+  fi
+fi
+
 mkdir -p "$OUTDIR" || exit 1
 START_TS=$SECONDS
 PATTERN="$DEFAULT_PATTERN"
@@ -462,12 +485,12 @@ if [ "$FETCH_ONLY" -eq 0 ]; then
     else
       { cat "$DIAG_FILE"; printf '\n'; printf '%s\n' "${LIN_PREP//__PATTERN__/$PATTERN}"; } > "$COMBINED_FILE"
     fi
-    OUT=$(run_remote "@$(native_path "$COMBINED_FILE")") || exit 1
+    OUT=$(run_remote "@$(native_path "$COMBINED_FILE")" "$DIAG_PARAMS") || exit 1
     if [ -z "$(printf '%s' "$OUT" | tr -d '[:space:]')" ]; then
       # Combined call produced nothing at all: the script likely never ran.
       # Fall back to the plain standalone diag call, then prep separately.
       err "Combined diagnostics call returned no output. Falling back to standalone diagnostics run."
-      OUT=$(run_remote "@$(native_path "$DIAG_FILE")") || exit 1
+      OUT=$(run_remote "@$(native_path "$DIAG_FILE")" "$DIAG_PARAMS") || exit 1
       printf '%s\n' "$OUT"
     else
       printf '%s\n' "$OUT" | grep -v '^META'
@@ -477,7 +500,7 @@ if [ "$FETCH_ONLY" -eq 0 ]; then
       fi
     fi
   else
-    OUT=$(run_remote "@$(native_path "$DIAG_FILE")") || exit 1
+    OUT=$(run_remote "@$(native_path "$DIAG_FILE")" "$DIAG_PARAMS") || exit 1
     printf '%s\n' "$OUT"
   fi
   log ""

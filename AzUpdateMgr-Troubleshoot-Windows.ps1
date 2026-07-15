@@ -29,11 +29,17 @@ param(
     [int]$TailLines           = 200,   # lines to tail from each large log
     [int]$RecentUpdateCount   = 25,    # hotfixes / update history entries to show
     [int]$EventCount          = 50,    # events per event-log query
-    [int]$PerCommandTimeoutSec = 45    # per-external-command timeout
+    [int]$PerCommandTimeoutSec = 45,   # per-external-command timeout
+    # Opt-in deep collection: converts the WU ETW trace (Get-WindowsUpdateLog,
+    # ~10-30s) and queries DeliveryOptimization error events. The only reliable
+    # way to surface WinHTTP-layer failures (e.g. 0x80072EFD) that never reach
+    # WU COM history or the patch extension's own log. String not [switch] so
+    # it can be passed through Run Command:  --parameters "IncludeWuLog=true"
+    [string]$IncludeWuLog     = 'false'
 )
 
 # --- Bootstrap ---------------------------------------------------------------
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 $ErrorActionPreference = 'Continue'    # never let one failure kill the script
 $ProgressPreference    = 'SilentlyContinue'
 $startedUtc            = (Get-Date).ToUniversalTime()
@@ -266,6 +272,66 @@ Invoke-Safe 'Update extension logs (tails)' {
         Get-ChildItem $arcLogs -Recurse -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 6 |
             ForEach-Object { Get-TailFile -Path $_.FullName -Lines $TailLines }
+    }
+}
+
+Invoke-Safe 'Update extension logs - full-file error scan' {
+    # The tails above miss errors that have scrolled out of the tail window:
+    # WindowsUpdateExtension.log runs multi-MB with heartbeats every ~25 min,
+    # so an error from a few hours ago is long gone from a 200-line tail.
+    # Scan ENTIRE files for error patterns and distinct HRESULT codes instead.
+    # A full-file Select-String is fast even at multi-MB sizes.
+    $targets = @()
+    $extLogRoot = 'C:\WindowsAzure\Logs\Plugins'
+    if (Test-Path $extLogRoot) {
+        Get-ChildItem $extLogRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'Patch|Update|Software' } |
+            ForEach-Object {
+                $targets += Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '\.log$|\.txt$' }
+            }
+    }
+    $arcLogs2 = 'C:\ProgramData\GuestConfig\extension_logs\Microsoft.SoftwareUpdateManagement.WindowsOsUpdateExtension'
+    if (Test-Path $arcLogs2) {
+        $targets += Get-ChildItem $arcLogs2 -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\.log$|\.txt$' }
+    }
+    if (-not $targets) { "  <no extension log files found>"; return }
+
+    $allCodes = @{}
+    foreach ($f in $targets) {
+        $hits = Select-String -LiteralPath $f.FullName `
+            -Pattern 'Exception from HRESULT|0x8[0-9A-Fa-f]{7}|\bERROR\b|\bFailed\b' `
+            -AllMatches -ErrorAction SilentlyContinue
+        if (-not $hits) { continue }
+        "  ---- $($f.FullName)  ($([math]::Round($f.Length/1MB,2)) MB, $(@($hits).Count) matching lines, last 40 shown) ----"
+        @($hits) | Select-Object -Last 40 | ForEach-Object { "    [$($_.LineNumber)] $($_.Line.Trim())" }
+        foreach ($h in @($hits)) {
+            foreach ($m in ([regex]::Matches($h.Line, '0x8[0-9A-Fa-f]{7}'))) {
+                $c = $m.Value.ToUpper()
+                if (-not $allCodes.ContainsKey($c)) {
+                    $allCodes[$c] = [pscustomobject]@{ Count = 0; LastLine = ''; File = '' }
+                }
+                $allCodes[$c].Count++
+                $allCodes[$c].LastLine = $h.Line.Trim()
+                $allCodes[$c].File = $f.Name
+            }
+        }
+    }
+    if ($allCodes.Count -gt 0) {
+        ""
+        "  Distinct HRESULT codes across extension logs (most frequent first):"
+        $allCodes.GetEnumerator() | Sort-Object { $_.Value.Count } -Descending | ForEach-Object {
+            $ll = $_.Value.LastLine
+            if ($ll.Length -gt 140) { $ll = $ll.Substring(0, 140) + '...' }
+            "    $($_.Key)  x$($_.Value.Count)  [$($_.Value.File)]  last: $ll"
+        }
+        $summary.ExtLogHresultCodes = @($allCodes.GetEnumerator() | Sort-Object { $_.Value.Count } -Descending |
+            Select-Object -First 8 | ForEach-Object {
+                [pscustomobject]@{ Code = $_.Key; Count = $_.Value.Count; File = $_.Value.File }
+            })
+    } else {
+        "  <no error patterns found in any extension log>"
     }
 }
 
@@ -730,6 +796,64 @@ Invoke-Safe 'Guest patch settings (from IMDS)' {
     }
 }
 
+# --- Optional deep sources (opt-in: -IncludeWuLog true) -------------------------
+# WinHTTP-layer failures during the WU SEARCH phase (0x80072EFD class) never
+# reach WU COM history (terminal install states only) and sit below the patch
+# extension's own try/catch, so they are invisible to the default collection.
+# The converted ETW trace is the only reliable source. Costs ~10-30s, and ETW
+# buffers rotate, so run this close to the failure window or it may show nothing.
+if ($IncludeWuLog -match '^(?i)(1|true|yes|on)$') {
+    Invoke-Safe 'WindowsUpdate.log (ETW conversion, opt-in)' {
+        $wuTxt = Join-Path $outDir "azdiag-wulog-$stamp.txt"
+        try {
+            Get-WindowsUpdateLog -LogPath $wuTxt -ErrorAction Stop *> $null
+        } catch {
+            "  <Get-WindowsUpdateLog failed: $($_.Exception.Message)>"
+            return
+        }
+        if (-not (Test-Path $wuTxt)) { "  <conversion produced no output>"; return }
+        $sizeMB = [math]::Round((Get-Item $wuTxt).Length / 1MB, 1)
+        "  Converted trace: $sizeMB MB"
+        $hits = Select-String -LiteralPath $wuTxt -Pattern '0x8[0-9A-Fa-f]{7}' -AllMatches -ErrorAction SilentlyContinue
+        $codes = @{}
+        foreach ($h in @($hits)) {
+            foreach ($m in ([regex]::Matches($h.Line, '0x8[0-9A-Fa-f]{7}'))) {
+                $c = $m.Value.ToUpper()
+                if (-not $codes.ContainsKey($c)) { $codes[$c] = 0 }
+                $codes[$c]++
+            }
+        }
+        if ($codes.Count -gt 0) {
+            "  Distinct HRESULT codes in WU trace ($(@($hits).Count) matching lines):"
+            $codes.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "    $($_.Key)  x$($_.Value)" }
+            ""
+            "  Last 60 matching lines:"
+            @($hits) | Select-Object -Last 60 | ForEach-Object { "    $($_.Line.Trim())" }
+            $summary.WuLogHresultCodes = @($codes.GetEnumerator() | Sort-Object Value -Descending |
+                Select-Object -First 8 | ForEach-Object { [pscustomobject]@{ Code = $_.Key; Count = $_.Value } })
+        } else {
+            "  <no HRESULT-style codes found in converted trace>"
+        }
+        $summary.WuLogCollected = $true
+        Remove-Item $wuTxt -Force -ErrorAction SilentlyContinue
+    }
+
+    Invoke-Safe 'DeliveryOptimization events (Error/Warning only, opt-in)' {
+        try {
+            Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-DeliveryOptimization/Operational'; Level = 2,3 } `
+                -MaxEvents 50 -ErrorAction Stop |
+                Select-Object TimeCreated, Id, LevelDisplayName,
+                    @{n='Message';e={
+                        $msg = ($_.Message -replace '\s+', ' ')
+                        if ($msg.Length -gt 200) { $msg.Substring(0, 200) + '...' } else { $msg }
+                    }} |
+                Format-Table -AutoSize -Wrap
+        } catch {
+            "  <no DO error/warning events, or log unavailable: $($_.Exception.Message)>"
+        }
+    }
+}
+
 # --- Summary enrichment (cheap, independent, best-effort) ---------------------
 try {
     $cv  = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
@@ -814,6 +938,14 @@ if ($summary.Contains('LastInstallSuccessTime')) {
 }
 if ($summary.Contains('RecentFailureCount')) {
     $L.Add(" Recent failures  : $($summary.RecentFailureCount) in last $RecentUpdateCount history entries")
+}
+if ($summary.Contains('ExtLogHresultCodes')) {
+    $codesStr = (@($summary.ExtLogHresultCodes) | Select-Object -First 4 | ForEach-Object { "$($_.Code) x$($_.Count)" }) -join ', '
+    $L.Add(" Ext log errors   : $codesStr")
+}
+if ($summary.Contains('WuLogHresultCodes')) {
+    $codesStr = (@($summary.WuLogHresultCodes) | Select-Object -First 4 | ForEach-Object { "$($_.Code) x$($_.Count)" }) -join ', '
+    $L.Add(" WU trace errors  : $codesStr")
 }
 if ($summary.Contains('EndpointsChecked')) {
     $bad = @($summary.EndpointsUnreachable)

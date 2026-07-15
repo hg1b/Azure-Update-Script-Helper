@@ -20,13 +20,13 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
 2. Pick Bash if asked
 3. Upload the three files: Manage files > Upload, or clone the repo:
    ```
-   git clone https://github.com/hg1b/Azure-Update-Script-Helper
-   cd Azure-Update-Script-Helper
+   git clone <repo-url>
+   cd <repo-folder>
    chmod +x azdiag.sh
    ```
 4. Cloud Shell is already logged in as you. Skip to "Pick your subscription".
 
-### Option B: Local terminal (Mac, Linux, Windows)
+### Option B: Local terminal (Mac or Linux)
 
 1. Install the Azure CLI:
    ```
@@ -35,44 +35,33 @@ Keep all three in the same folder. The collectors are strictly read-only: no ins
 
    # Ubuntu/Debian
    curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-
-   # Windows
-    winget install --id Microsoft.AzureCLI
-
    ```
 2. Log in:
    ```
    az login
    ```
    A browser window opens. If it doesn't, use `az login --use-device-code` and follow the prompt.
-
-3. Set Tenant Subscription
-   ```
-   az account set --subscription "subscription123"
-   ```
-
-4. Make the script executable (Mac Only!) (first time only):
+3. Make the script executable (first time only):
    ```
    chmod +x azdiag.sh
    ```
 
 ### Option C: Windows (WSL or Git Bash)
- 
+
 1. You need a bash environment: WSL (Ubuntu) or Git Bash. PowerShell alone can't run this script.
 2. In WSL, install unzip once (needed to extract Windows VM archives):
-```
+   ```
    sudo apt install unzip
-```
+   ```
 3. Run with `bash` in front instead of `./`:
-```
+   ```
    bash azdiag.sh -g my-resource-group -n my-vm-01 --full
-```
+   ```
 4. If you see errors like `$'\r': command not found`, the file picked up Windows line endings. Fix once:
-```
+   ```
    sed -i 's/\r//' azdiag.sh
-```
+   ```
 5. Both az CLI flavors work: the Windows az CLI called from WSL/Git Bash, or the Linux az CLI installed inside WSL. Path translation is handled automatically.
-
 
 ### Pick your subscription
 
@@ -88,12 +77,7 @@ Or skip this and pass `-s "SUB-NAME-OR-ID"` on every azdiag run.
 
 ## Run it
 
-Full diagnostic plus log retrieval, no prompts (Windows)
-```
-bash azdiag.sh -g <resource-group> -n <vm-name> --full
-```
-
-Full diagnostic plus log retrieval, no prompts (Mac)
+Full diagnostic plus log retrieval, no prompts:
 
 ```
 ./azdiag.sh -g <resource-group> -n <vm-name> --full
@@ -122,6 +106,14 @@ It auto-detects Windows vs Linux. Expect 8 to 10 minutes total. Almost all of th
 
 # Save retrieved files somewhere specific
 ./azdiag.sh -g RG -n VM --full -d ~/Desktop/myticket
+
+# Deep collection for search/assessment failures (Windows only, adds ~10-30s):
+# converts the WU ETW trace and queries DeliveryOptimization error events.
+# The only source for WinHTTP-layer failures like 0x80072EFD, which never
+# reach WU history or the extension log. Run it close to the failure window,
+# ETW buffers rotate. Use when the Update Manager portal shows a failed
+# assessment or a download-phase error code.
+./azdiag.sh -g RG -n VM --full --wu-log
 ```
 
 All options: `./azdiag.sh -h`
